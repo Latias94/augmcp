@@ -77,7 +77,7 @@ augmcp --persist-config \
 2）以 HTTP 模式运行（对外暴露 `/mcp` 与 REST 接口）：
 
 ```
-augmcp --transport http --bind 127.0.0.1:8888
+augmcp --bind 127.0.0.1:8888
 ```
 
 3）索引并绑定别名（可选，但推荐）：
@@ -173,13 +173,19 @@ HTTP（streamable，axum）：
 
 ## REST 接口（可选）
 
-运行 `--transport http` 时开放：
+HTTP（默认）端点：
 
 - `POST /api/search`
   - 请求：`{ "project_root_path"?: "...", "alias"?: "...", "query": "...", "skip_index_if_indexed"?: true }`
   - 行为：与 MCP 工具一致，若未索引会自动增量后检索
 
 - `POST /api/index`
+  - 支持 `{"async": true}` 后台索引，立即返回 `accepted`
+  - 停止任务：`POST /api/index/stop`（按路径或别名）
+  - 任务查询：`GET /api/tasks?project_root_path=...` 或 `?alias=...`（返回 running、progress、eta_secs）
+
+- `GET /healthz`
+  - 健康检查（标准 200 返回，JSON：`{ status: "ok", version: "..." }`）
   - 请求：`{ "project_root_path"?: "...", "alias"?: "...", "force_full"?: false }`
   - 返回：索引统计字符串
 

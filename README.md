@@ -75,7 +75,7 @@ augmcp --persist-config \
 2) Run as HTTP server (provides MCP at `/mcp` and REST helpers):
 
 ```
-augmcp --transport http --bind 127.0.0.1:8888
+augmcp --bind 127.0.0.1:8888
 ```
 
 3) Index a project and bind an alias (optional but recommended for convenience):
@@ -174,13 +174,19 @@ Returns: a short stats string (`total_blobs/new_blobs/existing_blobs`).
 
 ## REST API (optional)
 
-When running with `--transport http`:
+HTTP endpoints (default transport):
 
 - `POST /api/search`
   - Body: `{ "project_root_path"?: "...", "alias"?: "...", "query": "...", "skip_index_if_indexed"?: true }`
   - Behavior mirrors MCP tool: auto index if needed
 
 - `POST /api/index`
+  - Supports `{"async": true}` for background indexing (returns `accepted`)
+  - Stop task: `POST /api/index/stop` (by path or alias)
+  - Task query: `GET /api/tasks?project_root_path=...` or `?alias=...` (returns running, progress, eta_secs)
+
+- `GET /healthz`
+  - Liveness/health check (200 OK, JSON `{ status: "ok", version: "..." }`)
   - Body: `{ "project_root_path"?: "...", "alias"?: "...", "force_full"?: false }`
   - Returns stats string
 

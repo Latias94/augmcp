@@ -1,16 +1,21 @@
 //! REST backend client for uploading blobs and performing retrieval.
 
-use crate::{config::Config, indexer::{BlobUpload, ProjectsIndex}};
-use anyhow::{anyhow, Result};
-use reqwest::{Client, StatusCode};
+use crate::{config::Config, indexer::BlobUpload};
+use anyhow::{Result, anyhow};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
-struct BatchUploadPayload<'a> { blobs: &'a [BlobUpload] }
+struct BatchUploadPayload<'a> {
+    blobs: &'a [BlobUpload],
+}
 
 #[derive(Debug, Deserialize)]
-struct BatchUploadResp { #[serde(default)] blob_names: Vec<String> }
+struct BatchUploadResp {
+    #[serde(default)]
+    blob_names: Vec<String>,
+}
 
 #[derive(Debug, Serialize)]
 struct RetrievalBlobs<'a> {
@@ -30,7 +35,10 @@ struct RetrievalPayload<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct RetrievalResp { #[serde(default)] formatted_retrieval: String }
+struct RetrievalResp {
+    #[serde(default)]
+    formatted_retrieval: String,
+}
 
 fn auth_client(token: &str, timeout_secs: u64) -> Client {
     Client::builder()
@@ -61,27 +69,49 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("retry failed")))
 }
 
-pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<Vec<String>> {
-    if new_blobs.is_empty() { return Ok(Vec::new()); }
-    let url = format!("{}/batch-upload", cfg.settings.base_url.trim_end_matches('/'));
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UploadProgress {
+    pub chunk_index: usize,
+    pub chunks_total: usize,
+    pub uploaded_items: usize,
+    pub total_items: usize,
+    pub chunk_items: usize,
+    pub chunk_bytes: usize,
+}
+
+pub async fn upload_new_blobs_with_progress<F>(
+    cfg: &Config,
+    new_blobs: &[BlobUpload],
+    mut on_progress: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(UploadProgress),
+{
+    if new_blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!(
+        "{}/batch-upload",
+        cfg.settings.base_url.trim_end_matches('/')
+    );
     let client = auth_client(&cfg.settings.token, 30);
 
-    // 分批上传，避免一次性 payload 过大导致 413（Payload Too Large）
     let batch_size = cfg.settings.batch_size.max(1);
     let mut all_blob_names: Vec<String> = Vec::new();
     let total = new_blobs.len();
     let total_chunks = (total + batch_size - 1) / batch_size;
-    tracing::info!(total_new = total, batch_size, chunks = total_chunks, "upload start");
     let mut uploaded_cnt: usize = 0;
 
     for (idx, chunk) in new_blobs.chunks(batch_size).enumerate() {
         let payload = BatchUploadPayload { blobs: chunk };
         let resp: BatchUploadResp = retry(
             || async {
-                let r = client.post(&url)
+                let r = client
+                    .post(&url)
                     .bearer_auth(&cfg.settings.token)
                     .json(&payload)
-                    .send().await?;
+                    .send()
+                    .await?;
                 if !r.status().is_success() {
                     let sc = r.status();
                     let t = r.text().await.unwrap_or_default();
@@ -91,11 +121,76 @@ pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<
             },
             3,
             1000,
-        ).await?;
+        )
+        .await?;
         all_blob_names.extend(resp.blob_names);
         uploaded_cnt = (idx + 1) * batch_size;
-        if uploaded_cnt > total { uploaded_cnt = total; }
-        let percent = (uploaded_cnt as f64 * 100.0 / total as f64);
+        if uploaded_cnt > total {
+            uploaded_cnt = total;
+        }
+        let chunk_bytes: usize = chunk.iter().map(|b| b.content.len()).sum();
+        on_progress(UploadProgress {
+            chunk_index: idx + 1,
+            chunks_total: total_chunks,
+            uploaded_items: uploaded_cnt,
+            total_items: total,
+            chunk_items: chunk.len(),
+            chunk_bytes,
+        });
+    }
+    Ok(all_blob_names)
+}
+
+pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<Vec<String>> {
+    if new_blobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!(
+        "{}/batch-upload",
+        cfg.settings.base_url.trim_end_matches('/')
+    );
+    let client = auth_client(&cfg.settings.token, 30);
+
+    // 分批上传，避免一次性 payload 过大导致 413（Payload Too Large）
+    let batch_size = cfg.settings.batch_size.max(1);
+    let mut all_blob_names: Vec<String> = Vec::new();
+    let total = new_blobs.len();
+    let total_chunks = (total + batch_size - 1) / batch_size;
+    tracing::info!(
+        total_new = total,
+        batch_size,
+        chunks = total_chunks,
+        "upload start"
+    );
+    let mut uploaded_cnt: usize = 0;
+
+    for (idx, chunk) in new_blobs.chunks(batch_size).enumerate() {
+        let payload = BatchUploadPayload { blobs: chunk };
+        let resp: BatchUploadResp = retry(
+            || async {
+                let r = client
+                    .post(&url)
+                    .bearer_auth(&cfg.settings.token)
+                    .json(&payload)
+                    .send()
+                    .await?;
+                if !r.status().is_success() {
+                    let sc = r.status();
+                    let t = r.text().await.unwrap_or_default();
+                    return Err(anyhow!("upload failed: {} {}", sc, t));
+                }
+                Ok(r.json::<BatchUploadResp>().await?)
+            },
+            3,
+            1000,
+        )
+        .await?;
+        all_blob_names.extend(resp.blob_names);
+        uploaded_cnt = (idx + 1) * batch_size;
+        if uploaded_cnt > total {
+            uploaded_cnt = total;
+        }
+        let percent = uploaded_cnt as f64 * 100.0 / total as f64;
         // 估算字节数（可选）
         let chunk_bytes: usize = chunk.iter().map(|b| b.content.len()).sum();
         tracing::info!(
@@ -118,11 +213,18 @@ pub async fn retrieve_formatted(
     all_blob_names: &[String],
     query: &str,
 ) -> Result<String> {
-    let url = format!("{}/agents/codebase-retrieval", cfg.settings.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/agents/codebase-retrieval",
+        cfg.settings.base_url.trim_end_matches('/')
+    );
     let client = auth_client(&cfg.settings.token, 60);
     let payload = RetrievalPayload {
         information_request: query,
-        blobs: RetrievalBlobs { checkpoint_id: None, added_blobs: all_blob_names, deleted_blobs: vec![] },
+        blobs: RetrievalBlobs {
+            checkpoint_id: None,
+            added_blobs: all_blob_names,
+            deleted_blobs: vec![],
+        },
         dialog: vec![],
         max_output_length: 0,
         disable_codebase_retrieval: false,
@@ -131,10 +233,12 @@ pub async fn retrieve_formatted(
 
     let resp: RetrievalResp = retry(
         || async {
-            let r = client.post(&url)
+            let r = client
+                .post(&url)
                 .bearer_auth(&cfg.settings.token)
                 .json(&payload)
-                .send().await?;
+                .send()
+                .await?;
             if !r.status().is_success() {
                 let sc = r.status();
                 let t = r.text().await.unwrap_or_default();
@@ -144,7 +248,8 @@ pub async fn retrieve_formatted(
         },
         3,
         2000,
-    ).await?;
+    )
+    .await?;
 
     if resp.formatted_retrieval.trim().is_empty() {
         Ok("No relevant code context found for your query.".to_string())

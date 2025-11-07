@@ -2,9 +2,13 @@
 //!
 //! Reads `~/.augmcp/settings.toml`, creates with defaults on first run.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::{Path, PathBuf}};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 use toml;
 
 const ROOT_DIR_NAME: &str = ".augmcp";
@@ -33,19 +37,49 @@ impl Default for Settings {
             base_url: "https://api.example.com".to_string(),
             token: "your-token-here".to_string(),
             text_extensions: vec![
-                ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
-                ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php", ".md",
-                ".txt", ".json", ".yaml", ".yml", ".toml", ".xml", ".html",
-                ".css", ".scss", ".sql", ".sh", ".bash",
-            ].into_iter().map(|s| s.to_string()).collect(),
+                ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs", ".cpp", ".c", ".h",
+                ".hpp", ".cs", ".rb", ".php", ".md", ".txt", ".json", ".yaml", ".yml", ".toml",
+                ".xml", ".html", ".css", ".scss", ".sql", ".sh", ".bash",
+            ]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect(),
             exclude_patterns: vec![
-                ".venv", "venv", ".env", "env", "node_modules", ".git", ".svn",
-                ".hg", "__pycache__", ".pytest_cache", ".mypy_cache", ".tox",
-                ".eggs", "*.egg-info", "dist", "build", ".idea", ".vscode",
-                ".DS_Store", "*.pyc", "*.pyo", "*.pyd", ".Python", "pip-log.txt",
-                "pip-delete-this-directory.txt", ".coverage", "htmlcov", ".gradle",
-                "target", "bin", "obj",
-            ].into_iter().map(|s| s.to_string()).collect(),
+                ".venv",
+                "venv",
+                ".env",
+                "env",
+                "node_modules",
+                ".git",
+                ".svn",
+                ".hg",
+                "__pycache__",
+                ".pytest_cache",
+                ".mypy_cache",
+                ".tox",
+                ".eggs",
+                "*.egg-info",
+                "dist",
+                "build",
+                ".idea",
+                ".vscode",
+                ".DS_Store",
+                "*.pyc",
+                "*.pyo",
+                "*.pyd",
+                ".Python",
+                "pip-log.txt",
+                "pip-delete-this-directory.txt",
+                ".coverage",
+                "htmlcov",
+                ".gradle",
+                "target",
+                "bin",
+                "obj",
+            ]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect(),
         }
     }
 }
@@ -79,10 +113,19 @@ impl Config {
             s
         };
 
-        if let Some(u) = base_url { settings.base_url = u; }
-        if let Some(t) = token { settings.token = t; }
+        if let Some(u) = base_url {
+            settings.base_url = u;
+        }
+        if let Some(t) = token {
+            settings.token = t;
+        }
 
-        Ok(Self { settings, root_dir, data_dir, settings_path })
+        Ok(Self {
+            settings,
+            root_dir,
+            data_dir,
+            settings_path,
+        })
     }
 
     pub fn text_extensions_set(&self) -> HashSet<String> {
@@ -95,7 +138,9 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let text = toml::to_string_pretty(&self.settings)?;
-        if let Some(parent) = self.settings_path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = self.settings_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(&self.settings_path, text)?;
         Ok(())
     }

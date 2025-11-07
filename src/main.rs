@@ -1,25 +1,34 @@
-use augmcp::{config::Config, AugServer};
+use augmcp::backend;
+use augmcp::indexer::{ProjectsIndex, collect_blobs, incremental_plan};
+use augmcp::service;
+use augmcp::{AugServer, config::Config};
+use axum::Json;
+use axum::extract::State;
 use clap::{Parser, ValueEnum};
 use rmcp::serve_server;
-use rmcp::transport::streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tracing_appender::rolling;
-use axum::extract::State;
-use axum::Json;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService, session::local::LocalSessionManager,
+};
 use serde::{Deserialize, Serialize};
-use augmcp::indexer::{collect_blobs, ProjectsIndex, incremental_plan};
-use augmcp::backend;
-use std::{sync::Arc, collections::HashMap};
-use parking_lot::Mutex;
+use tracing_appender::rolling;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+// (unused prev imports removed)
 
 #[derive(Debug, Clone, ValueEnum)]
-enum TransportKind { Stdio, Http }
+enum TransportKind {
+    Stdio,
+    Http,
+}
 
 #[derive(Parser, Debug)]
-#[command(name = "augmcp", version, about = "MCP server for code indexing + retrieval")] 
+#[command(
+    name = "augmcp",
+    version,
+    about = "MCP server for code indexing + retrieval"
+)]
 struct Cli {
     /// Transport: stdio or http
-    #[arg(long, value_enum, default_value = "stdio")]
+    #[arg(long, value_enum, default_value = "http")]
     transport: TransportKind,
     /// HTTP bind address when transport=http
     #[arg(long, default_value = "127.0.0.1:8888")]
@@ -52,14 +61,22 @@ async fn main() -> anyhow::Result<()> {
     let file_appender = rolling::daily(&log_dir, "augmcp.log");
     let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_subscriber::fmt::layer().with_ansi(true))
-        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer),
+        )
         .init();
 
-    if cli.persist_config { cfg.save()?; }
+    if cli.persist_config {
+        cfg.save()?;
+    }
     tracing::info!(config_file = %cfg.settings_path.display(), data_dir = %cfg.data_dir.display(), log_file = %log_dir.join("augmcp.log").display(), "paths initialized");
-    
+
     // One-shot direct execution (no MCP) for quick testing
     if let (Some(path), Some(query)) = (cli.oneshot_path.clone(), cli.oneshot_query.clone()) {
         let project_key = augmcp::config::normalize_path(&path)?;
@@ -94,13 +111,27 @@ async fn main() -> anyhow::Result<()> {
         }
         TransportKind::Http => {
             #[derive(Debug, Deserialize)]
-            struct SearchReq { project_root_path: Option<String>, alias: Option<String>, query: String, skip_index_if_indexed: Option<bool> }
+            struct SearchReq {
+                project_root_path: Option<String>,
+                alias: Option<String>,
+                query: String,
+                skip_index_if_indexed: Option<bool>,
+            }
             #[derive(Debug, Serialize)]
-            struct SearchResp { status: String, result: String }
+            struct SearchResp {
+                status: String,
+                result: String,
+            }
             #[derive(Clone)]
-            struct AppState { server: AugServer, tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> }
+            struct AppState {
+                server: AugServer,
+                tasks: augmcp::tasks::TaskManager,
+            }
 
-            let app_state = AppState { server: server.clone(), tasks: Arc::new(Mutex::new(HashMap::new())) };
+            let app_state = AppState {
+                server: server.clone(),
+                tasks: augmcp::tasks::TaskManager::new(),
+            };
             let srv_factory = app_state.server.clone();
             let service = StreamableHttpService::new(
                 move || Ok(srv_factory.clone()),
@@ -110,53 +141,27 @@ async fn main() -> anyhow::Result<()> {
             let server_state = app_state.clone();
             let router = axum::Router::new()
                 .nest_service("/mcp", service)
+                .route("/healthz", axum::routing::get(|| async {
+                    #[derive(serde::Serialize)]
+                    struct HealthResp { status: &'static str, version: &'static str }
+                    axum::Json(HealthResp{ status: "ok", version: env!("CARGO_PKG_VERSION") })
+                }))
                 .route("/api/search", axum::routing::post(
                     |State(app): State<AppState>, Json(req): Json<SearchReq>| async move {
-                        use augmcp::indexer::Aliases;
                         let cfg = app.server.get_cfg();
-                        let aliases = Aliases::load(&cfg.aliases_file()).unwrap_or_default();
-                        let path_opt = match (&req.alias, &req.project_root_path) {
-                            (Some(a), _) => aliases.resolve(a).cloned(),
-                            (None, Some(p)) => Some(p.clone()),
-                            _ => None,
+                        let (project_key, path) = match service::resolve_target(&cfg, req.alias.clone(), req.project_root_path.clone()) {
+                            Ok(v) => v,
+                            Err(e) => return Json(SearchResp{ status: "error".into(), result: e.to_string() })
                         };
-                        let path = match path_opt { Some(p) => p, None => return Json(SearchResp{ status: "error".into(), result: "provide project_root_path or alias".into() }) };
                         tracing::info!(path = %path, "/api/search invoked");
-                        let project_key = match augmcp::config::normalize_path(&path) { Ok(x) => x, Err(e) => return Json(SearchResp{ status: "error".into(), result: format!("normalize error: {}", e)}) };
-
-                        let skip_if_indexed = req.skip_index_if_indexed.unwrap_or(true);
-                        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
-                        let mut all_blob_names: Vec<String> = Vec::new();
-                        let mut need_index = true;
-                        if skip_if_indexed {
-                            if let Some(existing) = projects.0.get(&project_key) {
-                                if !existing.is_empty() { all_blob_names = existing.clone(); need_index = false; }
-                            }
+                        if app.tasks.is_running(&project_key) {
+                            return Json(SearchResp{ status: "accepted".into(), result: "indexing in progress; please retry later".into() });
                         }
-                        if need_index {
-                            // 若该路径存在异步索引任务，在进行中则告知客户端稍后重试
-                            if app.tasks.lock().contains_key(&project_key) {
-                                return Json(SearchResp{ status: "accepted".into(), result: "indexing in progress; please retry later".into() });
-                            }
-                            let blobs = match collect_blobs(
-                                std::path::Path::new(&path),
-                                &cfg.text_extensions_set(),
-                                cfg.settings.max_lines_per_blob,
-                                &cfg.settings.exclude_patterns,
-                            ) { Ok(v) => v, Err(e) => return Json(SearchResp{ status: "error".into(), result: e.to_string()}) };
-                            if blobs.is_empty() { return Json(SearchResp{ status: "error".into(), result: "No text files found in project".into()}); }
-                            let (new_blobs, all_names) = incremental_plan(&project_key, &blobs, &projects);
-                            if !new_blobs.is_empty() {
-                                tracing::info!("uploading {} new blobs", new_blobs.len());
-                                if let Err(e) = backend::upload_new_blobs(&cfg, &new_blobs).await {
-                                    return Json(SearchResp{ status: "error".into(), result: format!("upload failed: {}", e)});
-                                }
-                            }
-                            projects.0.insert(project_key, all_names.clone());
-                            let _ = projects.save(&cfg.projects_file());
-                            all_blob_names = all_names;
-                        }
-                        let result = match backend::retrieve_formatted(&cfg, &all_blob_names, &req.query).await { Ok(s) => s, Err(e) => format!("Error: {}", e) };
+                        let skip = req.skip_index_if_indexed.unwrap_or(true);
+                        let result = match service::ensure_index_then_retrieve(&cfg, &project_key, &path, &req.query, skip).await {
+                            Ok(s) => s,
+                            Err(e) => format!("Error: {}", e),
+                        };
                         Json(SearchResp{ status: "success".into(), result })
                     }
                 ))
@@ -185,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
                         let run_async = req.r#async.unwrap_or(false);
                         // 去重：异步索引若已存在任务则直接返回
                         if run_async {
-                            if app.tasks.lock().contains_key(&project_key) {
+                            if app.tasks.is_running(&project_key) {
                                 return Json(IndexResp{ status: "accepted".into(), result: format!("indexing already in progress for {}", &path) });
                             }
                         }
@@ -193,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
                             let cfg_bg = cfg.clone();
                             let path_bg = path.clone();
                             let key_bg = project_key.clone();
-                            let tasks_map = app.tasks.clone();
+                            let _tasks_map = app.tasks.clone();
                             let handle = tokio::spawn(async move {
                                 tracing::info!(path = %path_bg, force_full = req.force_full.unwrap_or(false), "HTTP /api/index async start");
                                 let mut projects = ProjectsIndex::load(&cfg_bg.projects_file()).unwrap_or_default();
@@ -218,11 +223,9 @@ async fn main() -> anyhow::Result<()> {
                                 projects.0.insert(key_bg.clone(), all_names.clone());
                                 let _ = projects.save(&cfg_bg.projects_file());
                                 tracing::info!(blobs = all_names.len(), "HTTP /api/index async done");
-                                // 完成后移除任务标记
-                                let mut map = tasks_map.lock();
-                                map.remove(&key_bg);
+                                // 完成后移除任务标记 tasks.finish(&key_bg);
                             });
-                            app.tasks.lock().insert(project_key.clone(), handle);
+                            app.tasks.set_handle(&project_key, handle);
                             return Json(IndexResp{ status: "accepted".into(), result: format!("async indexing started for {}", &path) });
                         }
 
@@ -252,6 +255,33 @@ async fn main() -> anyhow::Result<()> {
                         Json(IndexResp{ status:"success".into(), result: msg })
                     }
                 ))
+                .route("/api/tasks", axum::routing::get(
+                    |State(app): State<AppState>, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                        #[derive(Serialize)]
+                        struct TaskResp { status: String, running: bool, progress: Option<augmcp::tasks::TaskProgress>, eta_secs: Option<u64> }
+                        let cfg = app.server.get_cfg();
+                        let alias = params.get("alias").cloned();
+                        let path = params.get("project_root_path").cloned();
+                        let (key, _p) = match service::resolve_target(&cfg, alias, path) {
+                            Ok(v) => v,
+                            Err(_) => return axum::Json(TaskResp{ status: "error".into(), running: false, progress: None, eta_secs: None }),
+                        };
+                        let running = app.tasks.is_running(&key);
+                        let progress = app.tasks.get(&key);
+                        let mut eta = None;
+                        if let Some(p) = &progress {
+                            if p.chunk_index > 0 && p.chunks_total > 0 && p.updated_at >= p.started_at {
+                                let elapsed = p.updated_at.saturating_sub(p.started_at);
+                                let remaining_chunks = p.chunks_total.saturating_sub(p.chunk_index);
+                                if elapsed > 0 && remaining_chunks > 0 {
+                                    let avg = elapsed / (p.chunk_index as u64).max(1);
+                                    eta = Some(avg.saturating_mul(remaining_chunks as u64));
+                                }
+                            }
+                        }
+                        axum::Json(TaskResp{ status: "success".into(), running, progress, eta_secs: eta })
+                    }
+                ))
                 .route("/api/index/stop", axum::routing::post(
                     |State(app): State<AppState>, Json(req): Json<serde_json::Value>| async move {
                         #[derive(Deserialize)]
@@ -263,30 +293,25 @@ async fn main() -> anyhow::Result<()> {
                         use augmcp::indexer::Aliases;
                         let aliases = Aliases::load(&cfg.aliases_file()).unwrap_or_default();
                         let path = match (req.alias.clone(), req.project_root_path.clone()) {
-                            (Some(a), Some(p)) => p,
+                            (Some(_), Some(p)) => p,
                             (Some(a), None) => match aliases.resolve(&a) { Some(p) => p.clone(), None => return Json(StopResp{ status:"error".into(), result: "alias not found and no path provided".into()}) },
                             (None, Some(p)) => p,
                             (None, None) => return Json(StopResp{ status:"error".into(), result: "provide project_root_path or alias".into()}),
                         };
                         let project_key = match augmcp::config::normalize_path(&path) { Ok(x)=>x, Err(e)=> return Json(StopResp{ status:"error".into(), result: e.to_string()}) };
-                        let mut map = app.tasks.lock();
-                        if let Some(handle) = map.remove(&project_key) {
-                            handle.abort();
-                            tracing::info!(path = %path, "HTTP /api/index/stop: aborted running task");
-                            return Json(StopResp{ status: "success".into(), result: "aborted".into() });
-                        }
-                        Json(StopResp{ status: "error".into(), result: "no running task".into() })
+                        if app.tasks.abort(&project_key) { tracing::info!(path = %path, "HTTP /api/index/stop: aborted running task"); return Json(StopResp{ status: "success".into(), result: "aborted".into() }); } Json(StopResp{ status: "error".into(), result: "no running task".into() })
                     }
                 ))
                 .with_state(server_state);
             let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
             tracing::info!("augmcp http server listening on {}", &cli.bind);
             axum::serve(listener, router)
-                .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+                .with_graceful_shutdown(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
                 .await?;
         }
     }
 
     Ok(())
 }
-
