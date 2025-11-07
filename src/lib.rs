@@ -8,9 +8,11 @@
 
 pub mod backend;
 pub mod config;
+pub mod http_router;
 pub mod indexer;
 pub mod server;
 pub mod service;
 pub mod tasks;
 
+pub use http_router::AppState;
 pub use server::AugServer;

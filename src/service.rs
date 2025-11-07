@@ -4,9 +4,9 @@ use crate::{
     indexer::{Aliases, ProjectsIndex, collect_blobs, incremental_plan},
 };
 use anyhow::{Result, anyhow};
+use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::OnceLock;
-use parking_lot::Mutex;
 
 // 全局互斥锁，保护 projects.json 的读/改/写，避免并发覆盖
 static PROJECTS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

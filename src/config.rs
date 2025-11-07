@@ -4,12 +4,12 @@
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
-use std::env;
 use toml;
 
 const ROOT_DIR_NAME: &str = ".augmcp";
@@ -121,20 +121,56 @@ impl Config {
             s
         };
         // 环境变量覆盖（优先级低于命令行，高于配置文件）
-        if let Ok(v) = env::var("AUGMCP_BASE_URL") { settings.base_url = v; }
-        if let Ok(v) = env::var("AUGMCP_TOKEN") { settings.token = v; }
-        if let Ok(v) = env::var("AUGMCP_BATCH_SIZE") { if let Ok(n) = v.parse::<usize>() { settings.batch_size = n; } }
-        if let Ok(v) = env::var("AUGMCP_MAX_LINES_PER_BLOB") { if let Ok(n) = v.parse::<usize>() { settings.max_lines_per_blob = n; } }
-        if let Ok(v) = env::var("AUGMCP_MAX_OUTPUT_LENGTH") { if let Ok(n) = v.parse::<u32>() { settings.max_output_length = n; } }
-        if let Ok(v) = env::var("AUGMCP_DISABLE_CODEBASE_RETRIEVAL") { if let Ok(b) = v.parse::<bool>() { settings.disable_codebase_retrieval = b; } }
-        if let Ok(v) = env::var("AUGMCP_ENABLE_COMMIT_RETRIEVAL") { if let Ok(b) = v.parse::<bool>() { settings.enable_commit_retrieval = b; } }
+        if let Ok(v) = env::var("AUGMCP_BASE_URL") {
+            settings.base_url = v;
+        }
+        if let Ok(v) = env::var("AUGMCP_TOKEN") {
+            settings.token = v;
+        }
+        if let Ok(v) = env::var("AUGMCP_BATCH_SIZE") {
+            if let Ok(n) = v.parse::<usize>() {
+                settings.batch_size = n;
+            }
+        }
+        if let Ok(v) = env::var("AUGMCP_MAX_LINES_PER_BLOB") {
+            if let Ok(n) = v.parse::<usize>() {
+                settings.max_lines_per_blob = n;
+            }
+        }
+        if let Ok(v) = env::var("AUGMCP_MAX_OUTPUT_LENGTH") {
+            if let Ok(n) = v.parse::<u32>() {
+                settings.max_output_length = n;
+            }
+        }
+        if let Ok(v) = env::var("AUGMCP_DISABLE_CODEBASE_RETRIEVAL") {
+            if let Ok(b) = v.parse::<bool>() {
+                settings.disable_codebase_retrieval = b;
+            }
+        }
+        if let Ok(v) = env::var("AUGMCP_ENABLE_COMMIT_RETRIEVAL") {
+            if let Ok(b) = v.parse::<bool>() {
+                settings.enable_commit_retrieval = b;
+            }
+        }
         if let Ok(v) = env::var("AUGMCP_TEXT_EXTENSIONS") {
-            let vec = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
-            if !vec.is_empty() { settings.text_extensions = vec; }
+            let vec = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            if !vec.is_empty() {
+                settings.text_extensions = vec;
+            }
         }
         if let Ok(v) = env::var("AUGMCP_EXCLUDE_PATTERNS") {
-            let vec = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
-            if !vec.is_empty() { settings.exclude_patterns = vec; }
+            let vec = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            if !vec.is_empty() {
+                settings.exclude_patterns = vec;
+            }
         }
 
         if let Some(u) = base_url {

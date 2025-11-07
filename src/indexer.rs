@@ -91,9 +91,20 @@ fn read_text_with_encodings(p: &Path) -> Result<String> {
 fn build_exclude_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut b = GlobSetBuilder::new();
     for pat in patterns {
-        // Support plain names like "node_modules" and wildcard patterns.
-        let g = Glob::new(pat).with_context(|| format!("invalid glob pattern: {pat}"))?;
-        b.add(g);
+        // 对于不含通配符的简单名字（如 node_modules、dist），扩展为匹配任意层级的同名目录及其内容
+        let has_glob = pat
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'));
+        if has_glob {
+            let g = Glob::new(pat).with_context(|| format!("invalid glob pattern: {pat}"))?;
+            b.add(g);
+        } else {
+            // **/pat 和 **/pat/**
+            let p1 = format!("**/{}", pat);
+            let p2 = format!("**/{}/**", pat);
+            b.add(Glob::new(&p1).with_context(|| format!("invalid glob pattern: {p1}"))?);
+            b.add(Glob::new(&p2).with_context(|| format!("invalid glob pattern: {p2}"))?);
+        }
     }
     Ok(b.build()?)
 }
