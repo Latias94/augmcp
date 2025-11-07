@@ -65,25 +65,52 @@ pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<
     if new_blobs.is_empty() { return Ok(Vec::new()); }
     let url = format!("{}/batch-upload", cfg.settings.base_url.trim_end_matches('/'));
     let client = auth_client(&cfg.settings.token, 30);
-    let payload = BatchUploadPayload { blobs: new_blobs };
 
-    let resp: BatchUploadResp = retry(
-        || async {
-            let r = client.post(&url)
-                .bearer_auth(&cfg.settings.token)
-                .json(&payload)
-                .send().await?;
-            if !r.status().is_success() {
-                let sc = r.status();
-                let t = r.text().await.unwrap_or_default();
-                return Err(anyhow!("upload failed: {} {}", sc, t));
-            }
-            Ok(r.json::<BatchUploadResp>().await?)
-        },
-        3,
-        1000,
-    ).await?;
-    Ok(resp.blob_names)
+    // 分批上传，避免一次性 payload 过大导致 413（Payload Too Large）
+    let batch_size = cfg.settings.batch_size.max(1);
+    let mut all_blob_names: Vec<String> = Vec::new();
+    let total = new_blobs.len();
+    let total_chunks = (total + batch_size - 1) / batch_size;
+    tracing::info!(total_new = total, batch_size, chunks = total_chunks, "upload start");
+    let mut uploaded_cnt: usize = 0;
+
+    for (idx, chunk) in new_blobs.chunks(batch_size).enumerate() {
+        let payload = BatchUploadPayload { blobs: chunk };
+        let resp: BatchUploadResp = retry(
+            || async {
+                let r = client.post(&url)
+                    .bearer_auth(&cfg.settings.token)
+                    .json(&payload)
+                    .send().await?;
+                if !r.status().is_success() {
+                    let sc = r.status();
+                    let t = r.text().await.unwrap_or_default();
+                    return Err(anyhow!("upload failed: {} {}", sc, t));
+                }
+                Ok(r.json::<BatchUploadResp>().await?)
+            },
+            3,
+            1000,
+        ).await?;
+        all_blob_names.extend(resp.blob_names);
+        uploaded_cnt = (idx + 1) * batch_size;
+        if uploaded_cnt > total { uploaded_cnt = total; }
+        let percent = (uploaded_cnt as f64 * 100.0 / total as f64);
+        // 估算字节数（可选）
+        let chunk_bytes: usize = chunk.iter().map(|b| b.content.len()).sum();
+        tracing::info!(
+            chunk = idx + 1,
+            chunks = total_chunks,
+            uploaded = uploaded_cnt,
+            total,
+            percent = format!("{percent:.1}%"),
+            chunk_items = chunk.len(),
+            chunk_bytes,
+            "upload progress"
+        );
+    }
+
+    Ok(all_blob_names)
 }
 
 pub async fn retrieve_formatted(

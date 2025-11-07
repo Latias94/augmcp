@@ -9,6 +9,8 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use augmcp::indexer::{collect_blobs, ProjectsIndex, incremental_plan};
 use augmcp::backend;
+use std::{sync::Arc, collections::HashMap};
+use parking_lot::Mutex;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum TransportKind { Stdio, Http }
@@ -95,20 +97,23 @@ async fn main() -> anyhow::Result<()> {
             struct SearchReq { project_root_path: Option<String>, alias: Option<String>, query: String, skip_index_if_indexed: Option<bool> }
             #[derive(Debug, Serialize)]
             struct SearchResp { status: String, result: String }
+            #[derive(Clone)]
+            struct AppState { server: AugServer, tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> }
 
-            let srv_factory = server.clone();
+            let app_state = AppState { server: server.clone(), tasks: Arc::new(Mutex::new(HashMap::new())) };
+            let srv_factory = app_state.server.clone();
             let service = StreamableHttpService::new(
                 move || Ok(srv_factory.clone()),
                 LocalSessionManager::default().into(),
                 Default::default(),
             );
-            let server_state = server.clone();
+            let server_state = app_state.clone();
             let router = axum::Router::new()
                 .nest_service("/mcp", service)
                 .route("/api/search", axum::routing::post(
-                    |State(srv): State<AugServer>, Json(req): Json<SearchReq>| async move {
+                    |State(app): State<AppState>, Json(req): Json<SearchReq>| async move {
                         use augmcp::indexer::Aliases;
-                        let cfg = srv.get_cfg();
+                        let cfg = app.server.get_cfg();
                         let aliases = Aliases::load(&cfg.aliases_file()).unwrap_or_default();
                         let path_opt = match (&req.alias, &req.project_root_path) {
                             (Some(a), _) => aliases.resolve(a).cloned(),
@@ -129,6 +134,10 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         if need_index {
+                            // 若该路径存在异步索引任务，在进行中则告知客户端稍后重试
+                            if app.tasks.lock().contains_key(&project_key) {
+                                return Json(SearchResp{ status: "accepted".into(), result: "indexing in progress; please retry later".into() });
+                            }
                             let blobs = match collect_blobs(
                                 std::path::Path::new(&path),
                                 &cfg.text_extensions_set(),
@@ -152,13 +161,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                 ))
                 .route("/api/index", axum::routing::post(
-                    |State(srv): State<AugServer>, Json(req): Json<serde_json::Value>| async move {
+                    |State(app): State<AppState>, Json(req): Json<serde_json::Value>| async move {
                         #[derive(Deserialize)]
-                        struct IndexReq { project_root_path: Option<String>, alias: Option<String>, force_full: Option<bool> }
+                        struct IndexReq {
+                            project_root_path: Option<String>,
+                            alias: Option<String>,
+                            force_full: Option<bool>,
+                            #[serde(rename = "async")] r#async: Option<bool>,
+                        }
                         #[derive(Serialize)]
                         struct IndexResp { status: String, result: String }
                         let req: IndexReq = match serde_json::from_value(req) { Ok(v) => v, Err(e) => return Json(IndexResp{ status: "error".into(), result: e.to_string() }) };
-                        let cfg = srv.get_cfg();
+                        let cfg = app.server.get_cfg();
                         use augmcp::indexer::Aliases;
                         let mut aliases = Aliases::load(&cfg.aliases_file()).unwrap_or_default();
                         let path = match (req.alias.clone(), req.project_root_path.clone()) {
@@ -168,6 +182,51 @@ async fn main() -> anyhow::Result<()> {
                             (None, None) => return Json(IndexResp{ status:"error".into(), result: "provide project_root_path or alias".into()}),
                         };
                         let project_key = match augmcp::config::normalize_path(&path) { Ok(x)=>x, Err(e)=> return Json(IndexResp{ status:"error".into(), result: e.to_string()}) };
+                        let run_async = req.r#async.unwrap_or(false);
+                        // 去重：异步索引若已存在任务则直接返回
+                        if run_async {
+                            if app.tasks.lock().contains_key(&project_key) {
+                                return Json(IndexResp{ status: "accepted".into(), result: format!("indexing already in progress for {}", &path) });
+                            }
+                        }
+                        if run_async {
+                            let cfg_bg = cfg.clone();
+                            let path_bg = path.clone();
+                            let key_bg = project_key.clone();
+                            let tasks_map = app.tasks.clone();
+                            let handle = tokio::spawn(async move {
+                                tracing::info!(path = %path_bg, force_full = req.force_full.unwrap_or(false), "HTTP /api/index async start");
+                                let mut projects = ProjectsIndex::load(&cfg_bg.projects_file()).unwrap_or_default();
+                                if req.force_full.unwrap_or(false) { projects.0.remove(&key_bg); }
+                                let blobs = match collect_blobs(
+                                    std::path::Path::new(&path_bg),
+                                    &cfg_bg.text_extensions_set(),
+                                    cfg_bg.settings.max_lines_per_blob,
+                                    &cfg_bg.settings.exclude_patterns,
+                                ) { Ok(v)=>v, Err(e)=> { tracing::error!(error=%e.to_string(), "collect_blobs failed"); return; } };
+                                tracing::info!(collected = blobs.len(), "files collected (async)");
+                                if blobs.is_empty() { tracing::warn!("No text files found in project"); return; }
+                                let (new_blobs, all_names) = incremental_plan(&key_bg, &blobs, &projects);
+                                tracing::info!(total = blobs.len(), new = new_blobs.len(), existing = (all_names.len().saturating_sub(new_blobs.len())), "incremental computed");
+                                if !new_blobs.is_empty() {
+                                    tracing::info!(uploading = new_blobs.len(), "uploading new blobs (async)");
+                                    if let Err(e) = backend::upload_new_blobs(&cfg_bg, &new_blobs).await {
+                                        tracing::error!(error=%e.to_string(), "upload failed (async)");
+                                        return;
+                                    }
+                                }
+                                projects.0.insert(key_bg.clone(), all_names.clone());
+                                let _ = projects.save(&cfg_bg.projects_file());
+                                tracing::info!(blobs = all_names.len(), "HTTP /api/index async done");
+                                // 完成后移除任务标记
+                                let mut map = tasks_map.lock();
+                                map.remove(&key_bg);
+                            });
+                            app.tasks.lock().insert(project_key.clone(), handle);
+                            return Json(IndexResp{ status: "accepted".into(), result: format!("async indexing started for {}", &path) });
+                        }
+
+                        tracing::info!(path = %path, force_full = req.force_full.unwrap_or(false), "HTTP /api/index start");
                         let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
                         if req.force_full.unwrap_or(false) { projects.0.remove(&project_key); }
                         let blobs = match collect_blobs(
@@ -176,9 +235,12 @@ async fn main() -> anyhow::Result<()> {
                             cfg.settings.max_lines_per_blob,
                             &cfg.settings.exclude_patterns,
                         ) { Ok(v)=>v, Err(e)=> return Json(IndexResp{ status:"error".into(), result: e.to_string()}) };
+                        tracing::info!(collected = blobs.len(), "files collected");
                         if blobs.is_empty() { return Json(IndexResp{ status:"error".into(), result: "No text files found in project".into()}); }
                         let (new_blobs, all_names) = incremental_plan(&project_key, &blobs, &projects);
+                        tracing::info!(total = blobs.len(), new = new_blobs.len(), existing = (all_names.len().saturating_sub(new_blobs.len())), "incremental computed");
                         if !new_blobs.is_empty() {
+                            tracing::info!(uploading = new_blobs.len(), "uploading new blobs");
                             if let Err(e) = backend::upload_new_blobs(&cfg, &new_blobs).await {
                                 return Json(IndexResp{ status:"error".into(), result: format!("upload failed: {}", e) });
                             }
@@ -186,7 +248,34 @@ async fn main() -> anyhow::Result<()> {
                         projects.0.insert(project_key, all_names.clone());
                         let _ = projects.save(&cfg.projects_file());
                         let msg = format!("Index complete: total_blobs={}, new_blobs={}, existing_blobs={}", all_names.len(), new_blobs.len(), all_names.len().saturating_sub(new_blobs.len()));
+                        tracing::info!("HTTP /api/index done: {}", msg);
                         Json(IndexResp{ status:"success".into(), result: msg })
+                    }
+                ))
+                .route("/api/index/stop", axum::routing::post(
+                    |State(app): State<AppState>, Json(req): Json<serde_json::Value>| async move {
+                        #[derive(Deserialize)]
+                        struct StopReq { project_root_path: Option<String>, alias: Option<String> }
+                        #[derive(Serialize)]
+                        struct StopResp { status: String, result: String }
+                        let req: StopReq = match serde_json::from_value(req) { Ok(v) => v, Err(e) => return Json(StopResp{ status: "error".into(), result: e.to_string() }) };
+                        let cfg = app.server.get_cfg();
+                        use augmcp::indexer::Aliases;
+                        let aliases = Aliases::load(&cfg.aliases_file()).unwrap_or_default();
+                        let path = match (req.alias.clone(), req.project_root_path.clone()) {
+                            (Some(a), Some(p)) => p,
+                            (Some(a), None) => match aliases.resolve(&a) { Some(p) => p.clone(), None => return Json(StopResp{ status:"error".into(), result: "alias not found and no path provided".into()}) },
+                            (None, Some(p)) => p,
+                            (None, None) => return Json(StopResp{ status:"error".into(), result: "provide project_root_path or alias".into()}),
+                        };
+                        let project_key = match augmcp::config::normalize_path(&path) { Ok(x)=>x, Err(e)=> return Json(StopResp{ status:"error".into(), result: e.to_string()}) };
+                        let mut map = app.tasks.lock();
+                        if let Some(handle) = map.remove(&project_key) {
+                            handle.abort();
+                            tracing::info!(path = %path, "HTTP /api/index/stop: aborted running task");
+                            return Json(StopResp{ status: "success".into(), result: "aborted".into() });
+                        }
+                        Json(StopResp{ status: "error".into(), result: "no running task".into() })
                     }
                 ))
                 .with_state(server_state);
@@ -200,3 +289,4 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
