@@ -17,9 +17,21 @@ Rust MCP server for codebase indexing and semantic search, inspired by acemcp, i
 - Optional REST endpoints for “index + search” convenience
 - All data under `~/.augmcp` (config, data, logs)
 
+
+
 ## Installation
 
-Build from source:
+Install via cargo-binstall (recommended):
+
+`
+# From GitHub Releases (no crates.io publish required)
+cargo binstall --github Latias94/augmcp augmcp
+
+# Once published to crates.io (optional)
+cargo binstall augmcp
+`
+
+Or build from source:
 
 ```
 # Clone
@@ -225,3 +237,4 @@ You can override settings via environment variables (lower priority than CLI `--
 - Start async indexing via `POST /api/index` with body `{ "async": true, ... }`.
 - Query progress and ETA via `GET /api/tasks?project_root_path=...` or `?alias=...`.
 - Stop a running task via `POST /api/index/stop` (by path or alias). Cancellation is responsive at chunk boundaries.
+

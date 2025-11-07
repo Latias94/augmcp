@@ -1,0 +1,82 @@
+name: Release (cargo-dist)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      dist-version: ${{ steps.plan.outputs.dist-version }}
+      plan-has-releases: ${{ steps.plan.outputs.plan-has-releases }}
+      runners: ${{ steps.plan.outputs.runners }}
+      local-artifacts: ${{ steps.plan.outputs.local-artifacts }}
+      global-artifacts: ${{ steps.plan.outputs.global-artifacts }}
+      publish-release: ${{ steps.plan.outputs.publish-release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-dist
+        run: |
+          curl -Ls https://github.com/axodotdev/cargo-dist/releases/download/v0.30.2/cargo-dist-installer.sh | sh
+      - id: plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo dist plan --tag ${{ github.ref_name }} --output-format github-actions
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [plan]
+    if: needs.plan.outputs.plan-has-releases == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.runners) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cargo-dist
+        run: |
+          curl -Ls https://github.com/axodotdev/cargo-dist/releases/download/${{ needs.plan.outputs.dist-version }}/cargo-dist-installer.sh | sh
+      - name: Build artifacts
+        run: |
+          cargo dist build --target ${{ matrix.target }} --artifacts local --tag ${{ github.ref_name }}
+      - name: Upload local artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.artifact-path }}
+
+  upload:
+    name: Publish Release
+    needs: [plan, build]
+    if: needs.plan.outputs.plan-has-releases == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-dist
+        run: |
+          curl -Ls https://github.com/axodotdev/cargo-dist/releases/download/${{ needs.plan.outputs.dist-version }}/cargo-dist-installer.sh | sh
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Upload to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo dist upload --artifacts global+local --tag ${{ github.ref_name }}

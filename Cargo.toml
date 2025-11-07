@@ -2,6 +2,8 @@
 name = "augmcp"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/Latias94/augmcp"
+readme = "README.md"
 
 [dependencies]
 rmcp = { version = "0.8.5", features = [
@@ -38,3 +40,22 @@ pathdiff = "0.2"
 tempfile = "3"
 serial_test = "3"
 tower = "0.5"
+
+[workspace.metadata.dist]
+# 使用的 cargo-dist 版本（与工作流保持一致）
+cargo-dist-version = "0.30.2"
+# CI 平台
+ci = "github"
+# 生成一键安装脚本（可选）
+installers = ["shell", "powershell"]
+# 预编译目标（可按需增减）
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+# 在 CI 环境允许忽略未提交改动（cargo-dist 需要读取计划）
+allow-dirty = ["ci"]
