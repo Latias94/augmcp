@@ -102,6 +102,9 @@ impl AugServer {
         };
         Ok(CallToolResult::success(vec![Content::text(formatted)]))
     }
+    #[tool(
+        description = "Index a project and persist cache. Optionally bind an alias or force full re-index."
+    )]
     pub async fn index_project(
         &self,
         Parameters(args): Parameters<IndexArgs>,
@@ -145,7 +148,10 @@ impl ServerHandler for AugServer {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("augmcp: search_context(project_root_path, query)".to_string()),
+            instructions: Some(
+                "augmcp tools: search_context(project_root_path?|alias?, query, skip_index_if_indexed?=true); index_project(project_root_path?|alias?, force_full?=false). Use forward slashes on Windows."
+                    .to_string(),
+            ),
         }
     }
 }

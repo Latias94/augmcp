@@ -210,3 +210,18 @@ Logs include: entry, file collection/splitting, incremental stats, uploads, inde
 
 - acemcp (original Python server): https://github.com/qy527145/acemcp
 - rmcp crate (0.8.5): Rust SDK for MCP.
+
+## Environment Variables
+
+You can override settings via environment variables (lower priority than CLI `--base-url/--token`):
+
+- `AUGMCP_BASE_URL`, `AUGMCP_TOKEN`
+- `AUGMCP_BATCH_SIZE`, `AUGMCP_MAX_LINES_PER_BLOB`
+- `AUGMCP_TEXT_EXTENSIONS` (comma-separated), `AUGMCP_EXCLUDE_PATTERNS` (comma-separated)
+- Retrieval tuning: `AUGMCP_MAX_OUTPUT_LENGTH`, `AUGMCP_DISABLE_CODEBASE_RETRIEVAL` (true/false), `AUGMCP_ENABLE_COMMIT_RETRIEVAL` (true/false)
+
+## Async Indexing & Cancel
+
+- Start async indexing via `POST /api/index` with body `{ "async": true, ... }`.
+- Query progress and ETA via `GET /api/tasks?project_root_path=...` or `?alias=...`.
+- Stop a running task via `POST /api/index/stop` (by path or alias). Cancellation is responsive at chunk boundaries.

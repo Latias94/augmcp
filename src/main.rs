@@ -1,5 +1,5 @@
 use augmcp::backend;
-use augmcp::indexer::{ProjectsIndex, collect_blobs, incremental_plan};
+// use augmcp::indexer::{ProjectsIndex, collect_blobs, incremental_plan};
 use augmcp::service;
 use augmcp::{AugServer, config::Config};
 use axum::Json;
@@ -80,23 +80,7 @@ async fn main() -> anyhow::Result<()> {
     // One-shot direct execution (no MCP) for quick testing
     if let (Some(path), Some(query)) = (cli.oneshot_path.clone(), cli.oneshot_query.clone()) {
         let project_key = augmcp::config::normalize_path(&path)?;
-        let blobs = collect_blobs(
-            std::path::Path::new(&path),
-            &cfg.text_extensions_set(),
-            cfg.settings.max_lines_per_blob,
-            &cfg.settings.exclude_patterns,
-        )?;
-        if blobs.is_empty() {
-            println!("Error: No text files found in project");
-            return Ok(());
-        }
-        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
-        let (new_blobs, all_blob_names) = incremental_plan(&project_key, &blobs, &projects);
-        if !new_blobs.is_empty() {
-            let _ = backend::upload_new_blobs(&cfg, &new_blobs).await?;
-        }
-        projects.0.insert(project_key, all_blob_names.clone());
-        let _ = projects.save(&cfg.projects_file());
+        let (_total, _newn, _existing, all_blob_names) = service::index_and_persist(&cfg, &project_key, &path, false).await?;
         let result = backend::retrieve_formatted(&cfg, &all_blob_names, &query).await?;
         println!("{}", result);
         return Ok(());
@@ -198,31 +182,37 @@ async fn main() -> anyhow::Result<()> {
                             let cfg_bg = cfg.clone();
                             let path_bg = path.clone();
                             let key_bg = project_key.clone();
+                            // 标记任务开始，便于 /api/tasks 立即可见
+                            let _ = app.tasks.begin(&project_key);
                             let _tasks_map = app.tasks.clone();
+                            let force_full = req.force_full.unwrap_or(false);
                             let handle = tokio::spawn(async move {
-                                tracing::info!(path = %path_bg, force_full = req.force_full.unwrap_or(false), "HTTP /api/index async start");
-                                let mut projects = ProjectsIndex::load(&cfg_bg.projects_file()).unwrap_or_default();
-                                if req.force_full.unwrap_or(false) { projects.0.remove(&key_bg); }
-                                let blobs = match collect_blobs(
-                                    std::path::Path::new(&path_bg),
-                                    &cfg_bg.text_extensions_set(),
-                                    cfg_bg.settings.max_lines_per_blob,
-                                    &cfg_bg.settings.exclude_patterns,
-                                ) { Ok(v)=>v, Err(e)=> { tracing::error!(error=%e.to_string(), "collect_blobs failed"); return; } };
-                                tracing::info!(collected = blobs.len(), "files collected (async)");
-                                if blobs.is_empty() { tracing::warn!("No text files found in project"); return; }
-                                let (new_blobs, all_names) = incremental_plan(&key_bg, &blobs, &projects);
-                                tracing::info!(total = blobs.len(), new = new_blobs.len(), existing = (all_names.len().saturating_sub(new_blobs.len())), "incremental computed");
-                                if !new_blobs.is_empty() {
-                                    tracing::info!(uploading = new_blobs.len(), "uploading new blobs (async)");
-                                    if let Err(e) = backend::upload_new_blobs(&cfg_bg, &new_blobs).await {
-                                        tracing::error!(error=%e.to_string(), "upload failed (async)");
-                                        return;
+                                tracing::info!(path = %path_bg, force_full = force_full, "HTTP /api/index async start");
+                                let tasks_bg = _tasks_map.clone();
+                                tasks_bg.set_phase(&key_bg, "collecting");
+                                let mut totals_set = false;
+                                match service::index_and_persist_with_progress(&cfg_bg, &key_bg, &path_bg, force_full, |p| {
+                                    if !totals_set {
+                                        tasks_bg.set_upload_totals(&key_bg, p.total_items, p.chunks_total, p.total_items);
+                                        totals_set = true;
+                                    }
+                                    tasks_bg.on_chunk(&key_bg, p.uploaded_items, p.chunk_index, p.chunk_bytes);
+                                }).await {
+                                    Ok((_total, _newn, _existing, all)) => {
+                                        tracing::info!(blobs = all.len(), "HTTP /api/index async done");
+                                        tasks_bg.finish(&key_bg);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error=%e.to_string(), "async index failed");
+                                        tasks_bg.fail(&key_bg, e.to_string());
                                     }
                                 }
-                                projects.0.insert(key_bg.clone(), all_names.clone());
-                                let _ = projects.save(&cfg_bg.projects_file());
-                                tracing::info!(blobs = all_names.len(), "HTTP /api/index async done");
+                                return;
+                                
+                                
+                                
+                                
+                                
                                 // 完成后移除任务标记 tasks.finish(&key_bg);
                             });
                             app.tasks.set_handle(&project_key, handle);
@@ -230,29 +220,14 @@ async fn main() -> anyhow::Result<()> {
                         }
 
                         tracing::info!(path = %path, force_full = req.force_full.unwrap_or(false), "HTTP /api/index start");
-                        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
-                        if req.force_full.unwrap_or(false) { projects.0.remove(&project_key); }
-                        let blobs = match collect_blobs(
-                            std::path::Path::new(&path),
-                            &cfg.text_extensions_set(),
-                            cfg.settings.max_lines_per_blob,
-                            &cfg.settings.exclude_patterns,
-                        ) { Ok(v)=>v, Err(e)=> return Json(IndexResp{ status:"error".into(), result: e.to_string()}) };
-                        tracing::info!(collected = blobs.len(), "files collected");
-                        if blobs.is_empty() { return Json(IndexResp{ status:"error".into(), result: "No text files found in project".into()}); }
-                        let (new_blobs, all_names) = incremental_plan(&project_key, &blobs, &projects);
-                        tracing::info!(total = blobs.len(), new = new_blobs.len(), existing = (all_names.len().saturating_sub(new_blobs.len())), "incremental computed");
-                        if !new_blobs.is_empty() {
-                            tracing::info!(uploading = new_blobs.len(), "uploading new blobs");
-                            if let Err(e) = backend::upload_new_blobs(&cfg, &new_blobs).await {
-                                return Json(IndexResp{ status:"error".into(), result: format!("upload failed: {}", e) });
+                        match service::index_and_persist(&cfg, &project_key, &path, req.force_full.unwrap_or(false)).await {
+                            Ok((total, newn, existing, _)) => {
+                                let msg = format!("Index complete: total_blobs={}, new_blobs={}, existing_blobs={}", total, newn, existing);
+                                tracing::info!("HTTP /api/index done: {}", msg);
+                                Json(IndexResp{ status:"success".into(), result: msg })
                             }
+                            Err(e) => Json(IndexResp{ status:"error".into(), result: e.to_string() })
                         }
-                        projects.0.insert(project_key, all_names.clone());
-                        let _ = projects.save(&cfg.projects_file());
-                        let msg = format!("Index complete: total_blobs={}, new_blobs={}, existing_blobs={}", all_names.len(), new_blobs.len(), all_names.len().saturating_sub(new_blobs.len()));
-                        tracing::info!("HTTP /api/index done: {}", msg);
-                        Json(IndexResp{ status:"success".into(), result: msg })
                     }
                 ))
                 .route("/api/tasks", axum::routing::get(

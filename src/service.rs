@@ -5,6 +5,11 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use std::path::Path;
+use std::sync::OnceLock;
+use parking_lot::Mutex;
+
+// 全局互斥锁，保护 projects.json 的读/改/写，避免并发覆盖
+static PROJECTS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// 解析 alias 与路径，返回 (normalized_project_key, path_string)。
 /// 若同时提供 alias 和 path，则绑定 alias -> normalized_path 并持久化。
@@ -49,11 +54,16 @@ pub async fn index_and_persist(
     if blobs.is_empty() {
         return Err(anyhow!("No text files found in project"));
     }
-    let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
-    if force_full {
-        projects.0.remove(project_key);
-    }
-    let (new_blobs, all_names) = incremental_plan(project_key, &blobs, &projects);
+    // 读取与计算增量在锁内，确保与其他并发写一致
+    let (new_blobs, all_names) = {
+        let m = PROJECTS_MUTEX.get_or_init(|| Mutex::new(()));
+        let _g = m.lock();
+        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
+        if force_full {
+            projects.0.remove(project_key);
+        }
+        incremental_plan(project_key, &blobs, &projects)
+    };
     let total = all_names.len();
     let newn = new_blobs.len();
     let existing = total.saturating_sub(newn);
@@ -61,10 +71,16 @@ pub async fn index_and_persist(
         tracing::info!(uploading = new_blobs.len(), "uploading new blobs (service)");
         let _ = backend::upload_new_blobs(cfg, &new_blobs).await?;
     }
-    projects
-        .0
-        .insert(project_key.to_string(), all_names.clone());
-    let _ = projects.save(&cfg.projects_file());
+    // 保存在锁内，避免并发覆盖
+    {
+        let m = PROJECTS_MUTEX.get_or_init(|| Mutex::new(()));
+        let _g = m.lock();
+        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
+        projects
+            .0
+            .insert(project_key.to_string(), all_names.clone());
+        projects.save(&cfg.projects_file())?;
+    }
     Ok((total, newn, existing, all_names))
 }
 
@@ -89,11 +105,16 @@ where
     if blobs.is_empty() {
         return Err(anyhow!("No text files found in project"));
     }
-    let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
-    if force_full {
-        projects.0.remove(project_key);
-    }
-    let (new_blobs, all_names) = incremental_plan(project_key, &blobs, &projects);
+    // 在锁内读取与计算增量
+    let (new_blobs, all_names) = {
+        let m = PROJECTS_MUTEX.get_or_init(|| Mutex::new(()));
+        let _g = m.lock();
+        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
+        if force_full {
+            projects.0.remove(project_key);
+        }
+        incremental_plan(project_key, &blobs, &projects)
+    };
     let total = all_names.len();
     let newn = new_blobs.len();
     let existing = total.saturating_sub(newn);
@@ -105,10 +126,16 @@ where
         let _ =
             backend::upload_new_blobs_with_progress(cfg, &new_blobs, |p| on_progress(p)).await?;
     }
-    projects
-        .0
-        .insert(project_key.to_string(), all_names.clone());
-    let _ = projects.save(&cfg.projects_file());
+    // 保存在锁内
+    {
+        let m = PROJECTS_MUTEX.get_or_init(|| Mutex::new(()));
+        let _g = m.lock();
+        let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
+        projects
+            .0
+            .insert(project_key.to_string(), all_names.clone());
+        projects.save(&cfg.projects_file())?;
+    }
     Ok((total, newn, existing, all_names))
 }
 
@@ -120,7 +147,11 @@ pub async fn ensure_index_then_retrieve(
     query: &str,
     skip_index_if_indexed: bool,
 ) -> Result<String> {
-    let mut projects = ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default();
+    let projects = {
+        let m = PROJECTS_MUTEX.get_or_init(|| Mutex::new(()));
+        let _g = m.lock();
+        ProjectsIndex::load(&cfg.projects_file()).unwrap_or_default()
+    };
     let mut all_blob_names: Vec<String> = Vec::new();
     let mut need_index = true;
     if skip_index_if_indexed {

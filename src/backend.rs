@@ -40,7 +40,7 @@ struct RetrievalResp {
     formatted_retrieval: String,
 }
 
-fn auth_client(token: &str, timeout_secs: u64) -> Client {
+fn auth_client(timeout_secs: u64) -> Client {
     Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .user_agent("augmcp/0.1")
@@ -94,13 +94,12 @@ where
         "{}/batch-upload",
         cfg.settings.base_url.trim_end_matches('/')
     );
-    let client = auth_client(&cfg.settings.token, 30);
+    let client = auth_client(30);
 
     let batch_size = cfg.settings.batch_size.max(1);
     let mut all_blob_names: Vec<String> = Vec::new();
     let total = new_blobs.len();
     let total_chunks = (total + batch_size - 1) / batch_size;
-    let mut uploaded_cnt: usize = 0;
 
     for (idx, chunk) in new_blobs.chunks(batch_size).enumerate() {
         let payload = BatchUploadPayload { blobs: chunk };
@@ -124,10 +123,7 @@ where
         )
         .await?;
         all_blob_names.extend(resp.blob_names);
-        uploaded_cnt = (idx + 1) * batch_size;
-        if uploaded_cnt > total {
-            uploaded_cnt = total;
-        }
+        let uploaded_cnt = ((idx + 1) * batch_size).min(total);
         let chunk_bytes: usize = chunk.iter().map(|b| b.content.len()).sum();
         on_progress(UploadProgress {
             chunk_index: idx + 1,
@@ -137,6 +133,8 @@ where
             chunk_items: chunk.len(),
             chunk_bytes,
         });
+        // 让出调度，便于任务被及时取消（/api/index/stop）
+        tokio::task::yield_now().await;
     }
     Ok(all_blob_names)
 }
@@ -149,7 +147,7 @@ pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<
         "{}/batch-upload",
         cfg.settings.base_url.trim_end_matches('/')
     );
-    let client = auth_client(&cfg.settings.token, 30);
+    let client = auth_client(30);
 
     // 分批上传，避免一次性 payload 过大导致 413（Payload Too Large）
     let batch_size = cfg.settings.batch_size.max(1);
@@ -162,8 +160,6 @@ pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<
         chunks = total_chunks,
         "upload start"
     );
-    let mut uploaded_cnt: usize = 0;
-
     for (idx, chunk) in new_blobs.chunks(batch_size).enumerate() {
         let payload = BatchUploadPayload { blobs: chunk };
         let resp: BatchUploadResp = retry(
@@ -186,10 +182,7 @@ pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<
         )
         .await?;
         all_blob_names.extend(resp.blob_names);
-        uploaded_cnt = (idx + 1) * batch_size;
-        if uploaded_cnt > total {
-            uploaded_cnt = total;
-        }
+        let uploaded_cnt = ((idx + 1) * batch_size).min(total);
         let percent = uploaded_cnt as f64 * 100.0 / total as f64;
         // 估算字节数（可选）
         let chunk_bytes: usize = chunk.iter().map(|b| b.content.len()).sum();
@@ -203,6 +196,8 @@ pub async fn upload_new_blobs(cfg: &Config, new_blobs: &[BlobUpload]) -> Result<
             chunk_bytes,
             "upload progress"
         );
+        // 让出调度，便于任务被及时取消（/api/index/stop）
+        tokio::task::yield_now().await;
     }
 
     Ok(all_blob_names)
@@ -217,7 +212,7 @@ pub async fn retrieve_formatted(
         "{}/agents/codebase-retrieval",
         cfg.settings.base_url.trim_end_matches('/')
     );
-    let client = auth_client(&cfg.settings.token, 60);
+    let client = auth_client(60);
     let payload = RetrievalPayload {
         information_request: query,
         blobs: RetrievalBlobs {
@@ -226,9 +221,9 @@ pub async fn retrieve_formatted(
             deleted_blobs: vec![],
         },
         dialog: vec![],
-        max_output_length: 0,
-        disable_codebase_retrieval: false,
-        enable_commit_retrieval: false,
+        max_output_length: cfg.settings.max_output_length,
+        disable_codebase_retrieval: cfg.settings.disable_codebase_retrieval,
+        enable_commit_retrieval: cfg.settings.enable_commit_retrieval,
     };
 
     let resp: RetrievalResp = retry(
